@@ -150,11 +150,11 @@ def decifragem(input_path, output_path, key_path):
     bits = []
     for i in range(n):
         base = i * chunk
-        link   = stream[base:base+link_len]
-        cipher = stream[base+link_len:base+chunk]
-        sb = bytesParaBits(cipher)
-        inv_sub  = faseSubstituicaoInversa(sb, link)
-        inv_diff = faseDifusaoInversa(inv_sub, link, key_bits)
+        vetor_cifrado = stream[base:base+link_len]
+        bloco_cifrado = stream[base+link_len:base+chunk]
+        sb = bytesParaBits(bloco_cifrado)
+        inv_sub  = faseSubstituicaoInversa(sb, vetor_cifrado)
+        inv_diff = faseDifusaoInversa(inv_sub, vetor_cifrado, key_bits)
         bits.extend(inv_diff)
     if pad:
         bits = bits[:-pad]
