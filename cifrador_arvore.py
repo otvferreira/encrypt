@@ -1,9 +1,10 @@
 import os
-import random
 import math
 
-BLOCK_BITS = 384  # tamanho fixo para permutação em árvore
+# --- Constante ---
+BLOCK_BITS = 384  # tamanho fixo do bloco em bits
 
+# --- Funções de leitura e escrita NetPBM ---
 def carregarImagemBinaria(path):
     with open(path, 'rb') as f:
         magic = f.readline().strip()
@@ -20,7 +21,13 @@ def carregarImagemBinaria(path):
         data = f.read()
     return magic, w, h, maxval, data
 
+def _escreverCabecalho(f, magic, w, h, maxval):
+    f.write(magic + b"\n")
+    f.write(f"{w} {h}\n".encode())
+    if maxval is not None:
+        f.write(f"{maxval}\n".encode())
 
+# --- Conversão bytes <-> bits ---
 def bytesParaBits(data):
     bits = []
     for byte in data:
@@ -28,32 +35,28 @@ def bytesParaBits(data):
             bits.append((byte >> i) & 1)
     return bits
 
-
 def bitsParaBytes(bits):
     ba = bytearray()
     for i in range(0, len(bits), 8):
-        b = 0
+        v = 0
         for bit in bits[i:i+8]:
-            b = (b << 1) | bit
-        ba.append(b)
+            v = (v << 1) | bit
+        ba.append(v)
     return bytes(ba)
 
-
+# --- Divisão em blocos + padding ---
 def dividirEmBlocos(bits, block_size=BLOCK_BITS):
     pad = (-len(bits)) % block_size
     if pad:
-        bits.extend([0]*pad)
-    n = len(bits)//block_size
+        bits.extend([0] * pad)
+    n = len(bits) // block_size
     blocks = [bits[i*block_size:(i+1)*block_size] for i in range(n)]
     return blocks, pad
 
-
-def gerarLinkAleatorio(bits_len=320):
-    return os.urandom(bits_len//8)
-
-
-def gerarKeystream(link):
-    state = [(link[i] >> (7-j)) & 1 for i in range(len(link)) for j in range(8)]
+# --- Geração de keystream (Regra 30) ---
+def gerarKeystream(seed_bytes):
+    state = [(seed_bytes[i] >> (7-j)) & 1
+             for i in range(len(seed_bytes)) for j in range(8)]
     state = state[:64]
     ks = []
     for _ in range(6):
@@ -67,67 +70,52 @@ def gerarKeystream(link):
         state = nxt
     return ks
 
+# --- Geração de link interno pela CA (Regra 30 sobre a chave) ---
+def gerarLinkInterno(key_bytes, link_bits_len=320):
+    # Converte a chave em keystream de 384 bits
+    ks = gerarKeystream(key_bytes)
+    bits = ks[:link_bits_len]
+    return bitsParaBytes(bits)
 
-def _escreverCabecalho(f, magic, w, h, maxval):
-    f.write(magic + b"\n")
-    f.write(f"{w} {h}\n".encode())
-    if maxval is not None:
-        f.write(f"{maxval}\n".encode())
-
-# --- Difusão CA-1.0 ---
+# --- Fase de Difusão ---
 def faseDifusao(bits_blk, link, key_bits):
     ks = gerarKeystream(link)
-    ext = key_bits * ((BLOCK_BITS//len(key_bits))+1)
+    ext = key_bits * ((BLOCK_BITS // len(key_bits)) + 1)
     ext = ext[:BLOCK_BITS]
     return [b ^ k ^ c for b,k,c in zip(bits_blk, ks, ext)]
 
 def faseDifusaoInversa(bits_blk, link, key_bits):
     return faseDifusao(bits_blk, link, key_bits)
 
+# --- Substituição via Árvore Binária ---
 def _gerar_permutacao_arvore(bits_len, link_bits):
-    """
-    Gera permutação de 0..bits_len-1 usando árvore binária completa.
-    """
-    # Número de folhas = próximo 2^k >= bits_len
     m = 1 << math.ceil(math.log2(bits_len))
-    # Lista de índices com padding None
     idxs = list(range(bits_len)) + [None] * (m - bits_len)
     perm = []
     it = iter(link_bits)
-
-    def recurse(node_list):
-        if len(node_list) == 1:
-            perm.append(node_list[0])
+    def recurse(lst):
+        if len(lst) == 1:
+            perm.append(lst[0])
             return
-        mid = len(node_list) // 2
-        left = node_list[:mid]
-        right = node_list[mid:]
-        bit = next(it, 0)
-        if bit == 0:
-            recurse(left)
-            recurse(right)
+        mid = len(lst) // 2
+        L, R = lst[:mid], lst[mid:]
+        if next(it, 0) == 0:
+            recurse(L)
+            recurse(R)
         else:
-            recurse(right)
-            recurse(left)
-
+            recurse(R)
+            recurse(L)
     recurse(idxs)
-    # Filtrar valores None e retornar apenas permutação válida
     return [i for i in perm if i is not None]
-
 
 def faseSubstituicao(bits_blk, link):
     link_bits = bytesParaBits(link)
-    # Gera permutação para todo o bloco
-    perm_full = _gerar_permutacao_arvore(BLOCK_BITS, link_bits)
-    # Aplica apenas aos bits presentes
-    perm = perm_full[:len(bits_blk)]
+    perm = _gerar_permutacao_arvore(BLOCK_BITS, link_bits)[:len(bits_blk)]
     return [bits_blk[i] for i in perm]
-
 
 def faseSubstituicaoInversa(sub_bits, link):
     link_bits = bytesParaBits(link)
-    perm_full = _gerar_permutacao_arvore(BLOCK_BITS, link_bits)
-    perm = perm_full[:len(sub_bits)]
+    perm = _gerar_permutacao_arvore(BLOCK_BITS, link_bits)[:len(sub_bits)]
     inv = [0] * len(sub_bits)
     for i, dst in enumerate(perm):
         inv[dst] = sub_bits[i]
@@ -136,40 +124,41 @@ def faseSubstituicaoInversa(sub_bits, link):
 # --- Operações principais ---
 def cifragem(input_path, output_path, key_path):
     magic, w, h, maxval, data = carregarImagemBinaria(input_path)
-    key_bits = bytesParaBits(open(key_path,'rb').read())
+    key_bytes = open(key_path, 'rb').read()
+    key_bits = bytesParaBits(key_bytes)
     bits = bytesParaBits(data)
     blocks, pad = dividirEmBlocos(bits)
-    with open(output_path,'wb') as f:
+    with open(output_path, 'wb') as f:
         _escreverCabecalho(f, magic, w, h, maxval)
         f.write(bytes([pad]))
         for blk in blocks:
-            link = gerarLinkAleatorio()
+            link = gerarLinkInterno(key_bytes)
             diff = faseDifusao(blk, link, key_bits)
-            sub = faseSubstituicao(diff, link)
+            sub  = faseSubstituicao(diff, link)
             f.write(link)
             f.write(bitsParaBytes(sub))
 
-
 def decifragem(input_path, output_path, key_path):
     magic, w, h, maxval, raw = carregarImagemBinaria(input_path)
-    key_bits = bytesParaBits(open(key_path,'rb').read())
+    key_bytes = open(key_path, 'rb').read()
+    key_bits = bytesParaBits(key_bytes)
     pad = raw[0]
     stream = raw[1:]
-    link_len = 40
-    chunk = link_len + (BLOCK_BITS//8)
-    n = len(stream)//chunk
+    link_len = len(gerarLinkInterno(key_bytes))
+    chunk = link_len + (BLOCK_BITS // 8)
+    n = len(stream) // chunk
     bits = []
     for i in range(n):
-        base = i*chunk
-        link = stream[base:base+link_len]
+        base = i * chunk
+        link   = stream[base:base+link_len]
         cipher = stream[base+link_len:base+chunk]
-        subb = bytesParaBits(cipher)
-        inv_sub = faseSubstituicaoInversa(subb, link)
+        sb = bytesParaBits(cipher)
+        inv_sub  = faseSubstituicaoInversa(sb, link)
         inv_diff = faseDifusaoInversa(inv_sub, link, key_bits)
         bits.extend(inv_diff)
     if pad:
         bits = bits[:-pad]
     data_out = bitsParaBytes(bits)
-    with open(output_path,'wb') as f:
+    with open(output_path, 'wb') as f:
         _escreverCabecalho(f, magic, w, h, maxval)
         f.write(data_out)
